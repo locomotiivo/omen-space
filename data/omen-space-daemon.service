@@ -6,6 +6,7 @@ Requires=dbus.service systemd-logind.service
 [Service]
 Type=simple
 ExecStartPre=/bin/sleep 2
+Environment=RUST_LOG=info
 ExecStart=/usr/libexec/omen-space/omen-space-daemon
 Restart=on-failure
 RestartSec=3

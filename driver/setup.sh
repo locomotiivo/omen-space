@@ -304,6 +304,11 @@ do_install() {
         done
     fi
     rm -rf "/var/lib/dkms/${MODNAME}/${MODVER}"
+    # Arch's DKMS hook builds every /usr/src/*-*/dkms.conf for each new kernel,
+    # so a leftover source dir brings its old version back next to this one.
+    for d in /usr/src/"${MODNAME}"-*; do
+        [ "$d" = "/usr/src/${MODNAME}-${MODVER}" ] || rm -rf "$d"
+    done
 
     # ── Stock hp-wmi override ────────────────────────────────────────────────
     # Must be done BEFORE depmod/dkms so that when the DKMS module lands in

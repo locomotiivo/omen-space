@@ -326,7 +326,7 @@ static const struct dmi_system_id victus_s_thermal_profile_boards[] __initconst 
 	},
 	{
 		.matches    = {DMI_MATCH(DMI_BOARD_NAME, "8E35")},
-		.driver_data = (void *)&omen_v1_thermal_params,
+		.driver_data = (void *)&omen_v1_no_ec_thermal_params,
 	},
 	{
 		.matches    = {DMI_MATCH(DMI_BOARD_NAME, "8C99")},
@@ -2642,9 +2642,14 @@ static int platform_profile_victus_s_get_ec(
 			*profile = PLATFORM_PROFILE_LOW_POWER;
 		else if (!current_ctgp_state && current_ppab_state)
 			*profile = PLATFORM_PROFILE_BALANCED;
-		else
+		else {
+			pr_warn("Unmapped GPU power state (ctgp=%d, ppab=%d) at EC thermal profile 0x%02x\n",
+				current_ctgp_state, current_ppab_state, tp);
 			return -EINVAL;
+		}
 	} else {
+		pr_warn("Unrecognised EC thermal profile value 0x%02x at offset 0x%02x\n",
+			tp, params->ec_tp_offset);
 		return -EINVAL;
 	}
 
@@ -3642,9 +3647,18 @@ static int hp_wmi_setup_fan_settings(struct hp_wmi_hwmon_priv *priv)
 				priv->uses_victus_s_fan_commands = true;
 				return 0;
 			}
-			pr_warn("Malformed or bogus fan table (max_rpm=%d), falling back to probing\n", max_rpm);
+			/*
+			 * Not malformed: on BIOS F.13 this query returns live
+			 * per-fan RPM rather than a curve, so the "max" reads
+			 * below the speed the fans are already running at.
+			 * Rejecting it is correct -- accepting it would cap the
+			 * fans at idle RPM. Probed limits are used instead.
+			 */
+			pr_info("Fan table reports no usable maximum (num_fans=%u, min_rpm=%u, max_rpm=%u); using probed limits\n",
+				fan_table->header.num_fans, min_rpm, max_rpm);
+		} else {
+			pr_warn("Malformed fan table, falling back to probing\n");
 		}
-		pr_warn("Malformed fan table, falling back to probing\n");
 	}
 
 	/* 2. Fallback: Probe Victus-S fan speed commands directly */

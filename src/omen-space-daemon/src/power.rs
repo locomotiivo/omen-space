@@ -501,6 +501,40 @@ impl PowerService {
         }
     }
 
+    /// Platform-profile interfaces as (profile_node, choices_node), most
+    /// canonical first.
+    ///
+    /// Kernel 6.14 moved the profile onto its own class device; the old
+    /// /sys/devices/platform/hp-wmi/platform_profile no longer exists and
+    /// .../platform-profile is now a *directory*. /sys/firmware/acpi/... is
+    /// deprecated compat. Probing only the old paths made every read fall
+    /// through to "balanced" and every write fail.
+    fn profile_paths() -> Vec<(String, String)> {
+        let mut v = Vec::new();
+        if let Ok(rd) = std::fs::read_dir("/sys/class/platform-profile") {
+            let mut dirs: Vec<_> = rd.flatten().map(|e| e.path()).collect();
+            dirs.sort();
+            for d in dirs {
+                let prof = d.join("profile");
+                if prof.exists() {
+                    v.push((
+                        prof.to_string_lossy().into_owned(),
+                        d.join("choices").to_string_lossy().into_owned(),
+                    ));
+                }
+            }
+        }
+        v.push((
+            "/sys/firmware/acpi/platform_profile".to_string(),
+            "/sys/firmware/acpi/platform_profile_choices".to_string(),
+        ));
+        v.push((
+            "/sys/devices/platform/hp-wmi/platform_profile".to_string(),
+            "/sys/devices/platform/hp-wmi/platform_profile_choices".to_string(),
+        ));
+        v
+    }
+
     async fn detect_current_profile() -> String {
         // 1. Prefer direct kernel hardware state (platform_profile / thermal_profile)
         // so placeholder power-profiles-daemon states never mask the real OMEN mode (#293, #297).
@@ -522,7 +556,7 @@ impl PowerService {
             "/sys/devices/platform/hp-omen/thermal_profile",
             "/sys/devices/platform/hp-omen/thermal-profile",
         ] {
-            if let Some(raw) = sysfs_read_async(p).await {
+            if let Some(raw) = sysfs_read_async(&p).await {
                 if raw.trim() == "1" { return "performance".to_string(); }
                 return "balanced".to_string();
             }
@@ -552,37 +586,26 @@ impl PowerService {
     }
 
     async fn get_available_profiles() -> Vec<String> {
-        // All known platform_profile paths — underscore and hyphen variants
-        let paths = [
-            "/sys/firmware/acpi/platform_profile",
-            "/sys/devices/platform/hp-wmi/platform_profile",
-            "/sys/devices/platform/hp-wmi/platform-profile",
-        ];
-        for p in paths {
-            if !sysfs_exists(p) { continue; }
-            // Try _choices suffix (underscore) then -choices (hyphen)
-            for choices_suffix in ["_choices", "-choices"] {
-                let choices_path = format!("{}{}", p, choices_suffix);
-                if let Some(choices_raw) = sysfs_read_async(&choices_path).await {
-                    let choices: Vec<String> = choices_raw
-                        .split_whitespace()
-                        .map(|s| s.trim_matches(|c| c == '[' || c == ']').to_lowercase())
-                        .map(|s| Self::normalize_profile(&s))
-                        .collect();
-                    if !choices.is_empty() {
-                        let mut unique = Vec::new();
-                        for c in choices {
-                            if !unique.contains(&c) {
-                                unique.push(c);
-                            }
-                        }
-                        return unique;
+        for (p, choices_path) in Self::profile_paths() {
+            if !sysfs_exists(&p) { continue; }
+            if let Some(choices_raw) = sysfs_read_async(&choices_path).await {
+                let mut unique: Vec<String> = Vec::new();
+                for c in choices_raw
+                    .split_whitespace()
+                    .map(|s| s.trim_matches(|c| c == '[' || c == ']').to_lowercase())
+                    .map(|s| Self::normalize_profile(&s))
+                {
+                    if !unique.contains(&c) {
+                        unique.push(c);
                     }
+                }
+                if !unique.is_empty() {
+                    return unique;
                 }
             }
         }
 
-        // Fallback to standard 3 profiles if WMI choices are missing
+        // Fallback to standard 3 profiles if the kernel exposes no choices
         vec!["power-saver".to_string(), "balanced".to_string(), "performance".to_string()]
     }
 
@@ -640,24 +663,11 @@ impl PowerService {
             ok = true; // PPD path never blocks success of the overall switch
         }
 
-        // 3. Fallback/Explicit Override: ACPI platform_profile — underscore and hyphen variants
-        let acpi_paths = [
-            "/sys/firmware/acpi/platform_profile",
-            "/sys/devices/platform/hp-wmi/platform_profile",
-            "/sys/devices/platform/hp-wmi/platform-profile",
-        ];
-        for p in acpi_paths {
-            if !sysfs_exists(p) { continue; }
+        // 3. Fallback/Explicit Override: platform profile sysfs nodes (class device first)
+        for (p, choices_path) in Self::profile_paths() {
+            if !sysfs_exists(&p) { continue; }
 
-            // Try _choices then -choices
-            let mut choices_raw = String::new();
-            for sfx in ["_choices", "-choices"] {
-                let cp = format!("{}{}", p, sfx);
-                if let Some(raw) = sysfs_read_async(&cp).await {
-                    choices_raw = raw;
-                    break;
-                }
-            }
+            let choices_raw = sysfs_read_async(&choices_path).await.unwrap_or_default();
 
             let choices: std::collections::HashSet<String> = if choices_raw.is_empty() {
                 std::collections::HashSet::new()
@@ -688,16 +698,17 @@ impl PowerService {
 
             // Skip the write if the current value already matches — avoids
             // redundant ACPI traffic on Strix Point BIOS (fix #282).
-            let current = sysfs_read_async(p).await;
+            let current = sysfs_read_async(&p).await;
             if current.as_deref() == Some(to_write) {
                 info!("platform_profile='{}' already set via {} — skipping write", to_write, p);
                 ok = true;
                 continue;
             }
 
-            if sysfs_write_async(p, to_write).await {
+            if sysfs_write_async(&p, to_write).await {
                 info!("Set platform_profile='{}' via {}", to_write, p);
                 ok = true;
+                break;
             }
         }
 
@@ -712,7 +723,7 @@ impl PowerService {
             "/sys/devices/platform/hp-omen/thermal-profile",
         ] {
             if !sysfs_exists(p) { continue; }
-            let current = sysfs_read_async(p).await;
+            let current = sysfs_read_async(&p).await;
             if current.as_deref() == Some(thermal_val) {
                 info!("thermal_profile={} already set via {} — skipping write", thermal_val, p);
                 ok = true;
